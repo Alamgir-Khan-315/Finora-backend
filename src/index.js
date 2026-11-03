@@ -12,7 +12,7 @@ app.use(helmet());
 
 // CLIENT_ORIGIN can hold several addresses separated by commas, e.g.
 // "http://localhost:5173,https://finora-frontend.vercel.app"
-const origins = (process.env.CLIENT_ORIGIN || "http://localhost:5173").split(",").map(x => x.trim().replace(/\/$/, ""));
+const origins = (process.env.CLIENT_ORIGIN || "http://localhost:5173" || "https://finorafrontend.vercel.app").split(",").map(x => x.trim().replace(/\/$/, ""));
 app.use(cors({ origin: (origin, cb) => (!origin || origins.includes("*") || origins.includes(origin)) ? cb(null, true) : cb(new Error("Origin not allowed by CORS")) }));
 app.use(express.json({ limit: "1mb" }));
 app.use(morgan("tiny"));
