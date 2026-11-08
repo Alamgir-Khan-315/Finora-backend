@@ -1,15 +1,9 @@
 import { Router } from "express";
-import { Sale } from "../models/index.js";
+import { Sale, Expense, Budget, Settings, CATEGORIES } from "../models/index.js";
+import { asyncRoute, clean, toDate } from "../lib/util.js";
 
 const router = Router();
 const STATUSES = ["Paid", "Pending", "Overdue", "Cancelled"];
-const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-const clean = value => String(value ?? "").trim();
-const toDate = value => {
-  if (!value) return undefined;
-  const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? undefined : d;
-};
 
 // Next invoice number: INV-1001, INV-1002, ...
 async function nextInvoiceNumber() {
@@ -33,6 +27,7 @@ function buildSale(input, { partial = false } = {}) {
     if (!STATUSES.includes(input.status)) return { error: "Status must be Paid, Pending, Overdue or Cancelled." };
     doc.status = input.status;
   }
+  if (has("paidAt")) doc.paidAt = toDate(input.paidAt) || null;
   if (has("method") || has("paymentMethod")) doc.method = clean(input.method ?? input.paymentMethod) || "Not recorded";
   if (has("currency")) doc.currency = clean(input.currency) || "PKR";
   if (has("notes")) doc.notes = clean(input.notes);
@@ -50,8 +45,24 @@ function buildSale(input, { partial = false } = {}) {
 }
 
 router.get("/health", (req, res) =>
-  res.json({ ok: true, database: req.app.locals.dbReady ? "connected" : "disconnected", service: "Finora API" })
+  res.json({ ok: true, database: req.app.locals.dbReady ? "connected" : "disconnected", service: "Finora API", ...(req.app.locals.dbReady ? {} : { reason: req.app.locals.dbError || "unknown" }) })
 );
+
+// Service-provider webhook: POST /api/integrations/sales with the x-sync-key header.
+router.post("/integrations/sales", asyncRoute(async (req, res) => {
+  const expected = process.env.SYNC_API_KEY;
+  if (!expected || req.get("x-sync-key") !== expected) return res.status(401).json({ message: "Invalid sync key." });
+  const incoming = Array.isArray(req.body) ? req.body : [req.body];
+  const saved = [];
+  for (const item of incoming) {
+    const { doc, error } = buildSale(item || {});
+    if (error) return res.status(400).json({ message: error, received: saved.length });
+    const reference = clean(item.reference) || (await nextInvoiceNumber());
+    if (doc.status === "Paid" && !doc.paidAt) doc.paidAt = doc.date || new Date();
+    saved.push(await Sale.create({ ...doc, reference }));
+  }
+  res.status(201).json({ received: saved.length, records: saved.map(x => x.toJSON()) });
+}));
 
 // List all sales (newest first)
 router.get("/sales", asyncRoute(async (req, res) => {
@@ -65,6 +76,7 @@ router.post("/sales", asyncRoute(async (req, res) => {
   const { doc, error } = buildSale(req.body || {});
   if (error) return res.status(400).json({ message: error });
   if (!doc.date) doc.date = new Date();
+  if (doc.status === "Paid" && !doc.paidAt) doc.paidAt = doc.date;
 
   // Retry once if two invoices are created at the same moment and get the same number.
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -82,7 +94,12 @@ router.post("/sales", asyncRoute(async (req, res) => {
 router.patch("/sales/:id", asyncRoute(async (req, res) => {
   const { doc, error } = buildSale(req.body || {}, { partial: true });
   if (error) return res.status(400).json({ message: error });
-  const sale = await Sale.findOneAndUpdate({ reference: req.params.id }, { $set: doc }, { new: true, runValidators: true });
+  const update = { $set: doc };
+  if (doc.status === "Paid") {
+    const current = await Sale.findOne({ reference: req.params.id }).select("status paidAt").lean();
+    if (current && !(current.status === "Paid" && current.paidAt) && !doc.paidAt) doc.paidAt = new Date();
+  } else if (doc.status) { delete doc.paidAt; update.$unset = { paidAt: 1 }; }
+  const sale = await Sale.findOneAndUpdate({ reference: req.params.id }, update, { new: true, runValidators: true });
   if (!sale) return res.status(404).json({ message: "Invoice not found." });
   res.json(sale.toJSON());
 }));
@@ -93,19 +110,61 @@ router.delete("/sales/:id", asyncRoute(async (req, res) => {
   res.json({ deleted: req.params.id });
 }));
 
-// Service-provider webhook: POST /api/integrations/sales with the x-sync-key header.
-router.post("/integrations/sales", asyncRoute(async (req, res) => {
-  const expected = process.env.SYNC_API_KEY;
-  if (!expected || req.get("x-sync-key") !== expected) return res.status(401).json({ message: "Invalid sync key." });
-  const incoming = Array.isArray(req.body) ? req.body : [req.body];
-  const saved = [];
-  for (const item of incoming) {
-    const { doc, error } = buildSale(item || {});
-    if (error) return res.status(400).json({ message: error, received: saved.length });
-    const reference = clean(item.reference) || (await nextInvoiceNumber());
-    saved.push(await Sale.create({ ...doc, reference }));
+// ---------- Expenses & monthly budgets ----------
+function buildExpense(input, { partial = false } = {}) {
+  const doc = {};
+  const has = k => input[k] !== undefined;
+  if (!partial || has("title")) { doc.title = clean(input.title); if (!doc.title) return { error: "Title is required." }; }
+  if (!partial || has("amount")) { doc.amount = Number(input.amount); if (!Number.isFinite(doc.amount) || doc.amount <= 0) return { error: "Amount must be greater than zero." }; }
+  if (has("category")) { if (!CATEGORIES.includes(input.category)) return { error: "Unknown category." }; doc.category = input.category; }
+  if (has("date")) doc.date = toDate(input.date) || new Date();
+  if (has("method")) doc.method = clean(input.method) || "Cash";
+  if (has("notes")) doc.notes = clean(input.notes);
+  return { doc };
+}
+
+router.get("/expenses", asyncRoute(async (req, res) => {
+  const q = {};
+  const from = toDate(req.query.from), to = toDate(req.query.to);
+  if (from || to) q.date = { ...(from && { $gte: from }), ...(to && { $lte: to }) };
+  res.json((await Expense.find(q).sort({ date: -1 }).limit(2000)).map(d => d.toJSON()));
+}));
+router.post("/expenses", asyncRoute(async (req, res) => {
+  const { doc, error } = buildExpense(req.body || {});
+  if (error) return res.status(400).json({ message: error });
+  res.status(201).json((await Expense.create(doc)).toJSON());
+}));
+router.delete("/expenses/:id", asyncRoute(async (req, res) => {
+  if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Expense not found." });
+  const e = await Expense.findByIdAndDelete(req.params.id);
+  if (!e) return res.status(404).json({ message: "Expense not found." });
+  res.json({ deleted: req.params.id });
+}));
+
+router.get("/budgets", asyncRoute(async (_req, res) => res.json((await Budget.find().sort({ category: 1 })).map(b => b.toJSON()))));
+router.put("/budgets/:category", asyncRoute(async (req, res) => {
+  if (!CATEGORIES.includes(req.params.category)) return res.status(400).json({ message: "Unknown category." });
+  const limit = Number(req.body?.limit);
+  if (!Number.isFinite(limit) || limit < 0) return res.status(400).json({ message: "Limit must be zero or more." });
+  const b = await Budget.findOneAndUpdate({ category: req.params.category }, { $set: { limit } }, { upsert: true, new: true, runValidators: true });
+  res.json(b.toJSON());
+}));
+
+// ---------- Business settings (stored in the database) ----------
+router.get("/settings", asyncRoute(async (_req, res) => {
+  const s = await Settings.findOneAndUpdate({ key: "main" }, { $setOnInsert: { key: "main" } }, { upsert: true, new: true });
+  res.json({ businessName: s.businessName, portfolio: s.portfolio });
+}));
+router.put("/settings", asyncRoute(async (req, res) => {
+  const set = {};
+  if (req.body?.businessName !== undefined) { set.businessName = clean(req.body.businessName); if (!set.businessName) return res.status(400).json({ message: "Business name cannot be empty." }); }
+  if (req.body?.portfolio !== undefined) {
+    const url = clean(req.body.portfolio);
+    if (url && !/^https?:\/\//i.test(url)) return res.status(400).json({ message: "Portfolio link must start with http:// or https://" });
+    set.portfolio = url;
   }
-  res.status(201).json({ received: saved.length, records: saved.map(x => x.toJSON()) });
+  const s = await Settings.findOneAndUpdate({ key: "main" }, { $set: set }, { upsert: true, new: true, runValidators: true });
+  res.json({ businessName: s.businessName, portfolio: s.portfolio });
 }));
 
 export default router;

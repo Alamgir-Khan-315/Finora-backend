@@ -35,9 +35,10 @@ async function connectDb() {
   await connecting;
 }
 app.use("/api", async (req, res, next) => {
-  try { await connectDb(); app.locals.dbReady = true; }
+  try { await connectDb(); app.locals.dbReady = true; app.locals.dbError = ""; }
   catch (err) {
     app.locals.dbReady = false;
+    app.locals.dbError = err.message;
     console.error("MongoDB connection failed:", err.message); // visible in Vercel > Logs
     if (req.path !== "/health") return res.status(503).json({ message: "Database is not reachable. Check MONGODB_URI and the Atlas Network Access list." });
   }
