@@ -6,6 +6,7 @@ const saleSchema = new mongoose.Schema(
     reference: { type: String, unique: true, index: true },
     customer: { type: String, required: true, trim: true },
     customerEmail: { type: String, default: "", trim: true },
+    customerPhone: { type: String, default: "", trim: true },   // WhatsApp number of the client
     service: { type: String, required: true, trim: true },
     date: { type: Date, default: Date.now },
     dueDate: { type: Date },

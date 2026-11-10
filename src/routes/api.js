@@ -2,6 +2,7 @@ import { Router } from "express";
 import { Sale, Expense, Budget, Settings, CATEGORIES } from "../models/index.js";
 import { asyncRoute, clean, toDate } from "../lib/util.js";
 
+export const API_VERSION = "3.1.0"; // frontend checks this to detect an outdated deployment
 const router = Router();
 const STATUSES = ["Paid", "Pending", "Overdue", "Cancelled"];
 
@@ -21,6 +22,11 @@ function buildSale(input, { partial = false } = {}) {
   if (!partial || has("service")) doc.service = clean(input.service ?? input.itemName);
   if (!partial || has("amount")) doc.amount = Number(input.amount ?? input.total);
   if (has("customerEmail")) doc.customerEmail = clean(input.customerEmail);
+  if (has("customerPhone")) {
+    doc.customerPhone = clean(input.customerPhone);
+    const digits = doc.customerPhone.replace(/\D/g, "");
+    if (doc.customerPhone && (!/^[+\d][\d\s\-()]*$/.test(doc.customerPhone) || digits.length < 7 || digits.length > 15)) return { error: "WhatsApp number must be 7 to 15 digits, e.g. 0300 1234567 or +92 300 1234567." };
+  }
   if (has("date")) doc.date = toDate(input.date) || new Date();
   if (has("dueDate")) doc.dueDate = toDate(input.dueDate) || null;
   if (has("status")) {
@@ -45,7 +51,7 @@ function buildSale(input, { partial = false } = {}) {
 }
 
 router.get("/health", (req, res) =>
-  res.json({ ok: true, database: req.app.locals.dbReady ? "connected" : "disconnected", service: "Finora API", ...(req.app.locals.dbReady ? {} : { reason: req.app.locals.dbError || "unknown" }) })
+  res.json({ ok: true, database: req.app.locals.dbReady ? "connected" : "disconnected", service: "Finora API", version: API_VERSION, ...(req.app.locals.dbReady ? {} : { reason: req.app.locals.dbError || "unknown" }) })
 );
 
 // Service-provider webhook: POST /api/integrations/sales with the x-sync-key header.

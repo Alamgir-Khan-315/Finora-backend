@@ -9,13 +9,12 @@ import api from "./routes/api.js";
 const app = express();
 app.disable("x-powered-by");
 app.use(helmet());
+// Lets the online website reach a backend running on your own computer (Chrome "private network" check).
+app.use((req, res, next) => { if (req.get("access-control-request-private-network")) res.set("Access-Control-Allow-Private-Network", "true"); next(); });
 
-// CLIENT_ORIGIN can hold additional addresses separated by commas.
-const origins = [
-  ...(process.env.CLIENT_ORIGIN || "http://localhost:5173").split(","),
-  "https://finorafrontend.vercel.app"
-].map(x => x.trim().replace(/\/$/, "")).filter(Boolean);
-app.use(cors({ origin: (origin, cb) => (!origin || origins.includes("*") || origins.includes(origin)) ? cb(null, true) : cb(new Error("Origin not allowed by CORS")) }));
+// There is no login, so CORS is not a security boundary (anyone can call the API directly).
+// Allow every website origin so the frontend works from any Vercel URL, preview link or localhost.
+app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 app.use(morgan("tiny"));
 app.locals.dbReady = false;
