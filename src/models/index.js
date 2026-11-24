@@ -56,7 +56,7 @@ const expenseSchema = new mongoose.Schema(
     title: { type: String, required: true, trim: true },
     payee: { type: String, default: "", trim: true, index: true },   // who the money went to: employee, seller, contractor...
     payeeType: { type: String, enum: PAYEE_TYPES, default: "Other" },
-    category: { type: String, enum: CATEGORIES, default: "Other", index: true },
+    category: { type: String, default: "Other", trim: true, index: true },   // a built-in category or the name of a custom expense profile
     amount: { type: Number, required: true, min: 0 },
     date: { type: Date, default: Date.now, index: true },
     method: { type: String, default: "Cash" },
@@ -73,7 +73,7 @@ const payableSchema = new mongoose.Schema(
     payeePhone: { type: String, default: "", trim: true },          // WhatsApp number of the person you pay
     payeeType: { type: String, enum: PAYEE_TYPES, default: "Other" },
     title: { type: String, required: true, trim: true },             // what the payment is for
-    category: { type: String, enum: CATEGORIES, default: "Other", index: true },
+    category: { type: String, default: "Other", trim: true, index: true },
     amount: { type: Number, required: true, min: 0 },                // total you have to pay
     date: { type: Date, default: Date.now },
     dueDate: { type: Date },
@@ -97,6 +97,13 @@ const payableSchema = new mongoose.Schema(
   }
 );
 export const Payable = mongoose.model("Payable", payableSchema);
+
+// A custom expense profile (like "Home" or a person's name). The built-in categories are profiles too, but they live in code.
+const profileSchema = new mongoose.Schema(
+  { name: { type: String, required: true, trim: true, unique: true, maxlength: 40 } },
+  { timestamps: true, versionKey: false, toJSON: idOnly }
+);
+export const Profile = mongoose.model("Profile", profileSchema);
 
 // One monthly limit per category.
 const budgetSchema = new mongoose.Schema(

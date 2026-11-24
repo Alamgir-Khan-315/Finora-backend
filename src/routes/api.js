@@ -1,10 +1,10 @@
 import { Router } from "express";
-import { Sale, Expense, Budget, Settings, Work, Payable, CATEGORIES, PAYEE_TYPES } from "../models/index.js";
+import { Sale, Expense, Budget, Settings, Work, Payable, Profile, CATEGORIES, PAYEE_TYPES } from "../models/index.js";
 import { asyncRoute, clean, toDate, escapeRegex } from "../lib/util.js";
 import { money2, settle, balanceOf } from "../lib/payments.js";
 import { notifyCustomer, notifyPayee } from "../lib/notify.js";
 
-export const API_VERSION = "4.0.0"; // frontend checks this to detect an outdated deployment
+export const API_VERSION = "4.1.0"; // frontend checks this to detect an outdated deployment
 const router = Router();
 const STATUSES = ["Paid", "Partial", "Pending", "Overdue", "Cancelled"];
 const METHODS = ["Cash", "Bank Transfer", "Card", "Online", "Cheque", "Not recorded"];
@@ -201,15 +201,52 @@ router.delete("/sales/:id", asyncRoute(async (req, res) => {
   res.json({ deleted: req.params.id });
 }));
 
+// ---------- Expense profiles ----------
+// Every category is a profile (Rent, Labour...). You can also create your own (a person, a site, "Home"...).
+// Expenses and bills keep the profile name in `category`.
+const categoryNames = async () => [...CATEGORIES, ...(await Profile.find().select("name").lean()).map(p => p.name)];
+const profileName = v => clean(v).replace(/\s+/g, " ").slice(0, 40);
+async function checkProfileName(name, exceptId) {
+  if (!name) return "Enter a name for the profile.";
+  if (CATEGORIES.some(c => c.toLowerCase() === name.toLowerCase())) return "A built-in profile with this name already exists.";
+  const dup = await Profile.findOne({ name: new RegExp(`^${escapeRegex(name)}$`, "i") }).select("_id").lean();
+  if (dup && String(dup._id) !== String(exceptId || "")) return "A profile with this name already exists.";
+  return "";
+}
+router.get("/profiles", asyncRoute(async (_req, res) => res.json((await Profile.find().sort({ name: 1 })).map(p => p.toJSON()))));
+router.post("/profiles", asyncRoute(async (req, res) => {
+  const name = profileName(req.body?.name), problem = await checkProfileName(name);
+  if (problem) return res.status(400).json({ message: problem });
+  res.status(201).json((await Profile.create({ name })).toJSON());
+}));
+router.patch("/profiles/:id", asyncRoute(async (req, res) => {
+  if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Profile not found." });
+  const p = await Profile.findById(req.params.id);
+  if (!p) return res.status(404).json({ message: "Profile not found." });
+  const name = profileName(req.body?.name), problem = await checkProfileName(name, p._id);
+  if (problem) return res.status(400).json({ message: problem });
+  const old = p.name; p.name = name; await p.save();
+  await Promise.all([Expense.updateMany({ category: old }, { $set: { category: name } }), Payable.updateMany({ category: old }, { $set: { category: name } })]);
+  res.json(p.toJSON());
+}));
+// Deleting a profile never deletes money records: its expenses and bills move to "Other".
+router.delete("/profiles/:id", asyncRoute(async (req, res) => {
+  if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Profile not found." });
+  const p = await Profile.findByIdAndDelete(req.params.id);
+  if (!p) return res.status(404).json({ message: "Profile not found." });
+  await Promise.all([Expense.updateMany({ category: p.name }, { $set: { category: "Other" } }), Payable.updateMany({ category: p.name }, { $set: { category: "Other" } })]);
+  res.json({ deleted: req.params.id, movedTo: "Other" });
+}));
+
 // ---------- Expenses & monthly budgets ----------
-function buildExpense(input, { partial = false } = {}) {
+function buildExpense(input, { partial = false, cats = CATEGORIES } = {}) {
   const doc = {};
   const has = k => input[k] !== undefined;
   if (!partial || has("title")) { doc.title = clean(input.title); if (!doc.title) return { error: "Title is required." }; }
   if (has("payee")) doc.payee = clean(input.payee);
   if (has("payeeType")) { if (!PAYEE_TYPES.includes(input.payeeType)) return { error: "Unknown person type." }; doc.payeeType = input.payeeType; }
   if (!partial || has("amount")) { doc.amount = Number(input.amount); if (!Number.isFinite(doc.amount) || doc.amount <= 0) return { error: "Amount must be greater than zero." }; }
-  if (has("category")) { if (!CATEGORIES.includes(input.category)) return { error: "Unknown category." }; doc.category = input.category; }
+  if (has("category")) { const c = cats.find(x => x.toLowerCase() === clean(input.category).toLowerCase()); if (!c) return { error: "Unknown category or profile." }; doc.category = c; }
   if (has("date")) doc.date = toDate(input.date) || new Date();
   if (has("method")) doc.method = clean(input.method) || "Cash";
   if (has("notes")) doc.notes = clean(input.notes);
@@ -227,7 +264,7 @@ router.get("/expenses", asyncRoute(async (req, res) => {
   res.json((await Expense.find(q).sort({ date: -1 }).limit(2000)).map(d => d.toJSON()));
 }));
 router.post("/expenses", asyncRoute(async (req, res) => {
-  const { doc, error } = buildExpense(req.body || {});
+  const { doc, error } = buildExpense(req.body || {}, { cats: await categoryNames() });
   if (error) return res.status(400).json({ message: error });
   res.status(201).json((await Expense.create(doc)).toJSON());
 }));
@@ -249,7 +286,7 @@ router.put("/budgets/:category", asyncRoute(async (req, res) => {
 
 // ---------- Bills to pay (money you owe to employees / sellers), with part payments ----------
 const isId = id => /^[a-f\d]{24}$/i.test(id);
-function buildBill(input, { partial = false } = {}) {
+function buildBill(input, { partial = false, cats = CATEGORIES } = {}) {
   const doc = {};
   const has = k => input[k] !== undefined;
   if (!partial || has("payee")) { doc.payee = clean(input.payee); if (!doc.payee) return { error: "Enter the name of the person you are paying." }; }
@@ -261,7 +298,7 @@ function buildBill(input, { partial = false } = {}) {
     if (doc.payeePhone && (!/^[+\d][\d\s\-()]*$/.test(doc.payeePhone) || digits.length < 7 || digits.length > 15)) return { error: "WhatsApp number must be 7 to 15 digits, e.g. 0300 1234567." };
   }
   if (has("payeeType")) { if (!PAYEE_TYPES.includes(input.payeeType)) return { error: "Unknown person type." }; doc.payeeType = input.payeeType; }
-  if (has("category")) { if (!CATEGORIES.includes(input.category)) return { error: "Unknown category." }; doc.category = input.category; }
+  if (has("category")) { const c = cats.find(x => x.toLowerCase() === clean(input.category).toLowerCase()); if (!c) return { error: "Unknown category or profile." }; doc.category = c; }
   if (has("date")) doc.date = toDate(input.date) || new Date();
   if (has("dueDate")) doc.dueDate = toDate(input.dueDate) || null;
   if (has("method")) doc.method = clean(input.method) || "Not recorded";
@@ -278,7 +315,7 @@ router.get("/payables", asyncRoute(async (req, res) => {
 }));
 
 router.post("/payables", asyncRoute(async (req, res) => {
-  const { doc, error } = buildBill(req.body || {});
+  const { doc, error } = buildBill(req.body || {}, { cats: await categoryNames() });
   if (error) return res.status(400).json({ message: error });
   let paid = Number(req.body?.paidNow ?? 0);
   if (!Number.isFinite(paid) || paid < 0) return res.status(400).json({ message: "Amount paid must be zero or more." });
@@ -294,7 +331,7 @@ router.post("/payables", asyncRoute(async (req, res) => {
 // Update a bill. Asking for "Paid" records the remaining balance as a payment. Returns `notification` when the person should hear about it.
 router.patch("/payables/:id", asyncRoute(async (req, res) => {
   if (!isId(req.params.id)) return res.status(404).json({ message: "Bill not found." });
-  const { doc, error } = buildBill(req.body || {}, { partial: true });
+  const { doc, error } = buildBill(req.body || {}, { partial: true, cats: await categoryNames() });
   if (error) return res.status(400).json({ message: error });
   const bill = await Payable.findById(req.params.id);
   if (!bill) return res.status(404).json({ message: "Bill not found." });
