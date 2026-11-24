@@ -471,6 +471,13 @@ router.get("/settings", asyncRoute(async (_req, res) => {
 router.put("/settings", asyncRoute(async (req, res) => {
   const set = {};
   if (req.body?.businessName !== undefined) { set.businessName = clean(req.body.businessName); if (!set.businessName) return res.status(400).json({ message: "Business name cannot be empty." }); }
+  // The developer portfolio link is fixed in the app; it can no longer be changed through the API.
+  const s = await Settings.findOneAndUpdate({ key: "main" }, { $setOnInsert: { key: "main" } }, { upsert: true, new: true });
+  res.json({ businessName: s.businessName, portfolio: s.portfolio });
+}));
+router.put("/settings", asyncRoute(async (req, res) => {
+  const set = {};
+  if (req.body?.businessName !== undefined) { set.businessName = clean(req.body.businessName); if (!set.businessName) return res.status(400).json({ message: "Business name cannot be empty." }); }
   if (req.body?.portfolio !== undefined) {
     const url = clean(req.body.portfolio);
     if (url && !/^https?:\/\//i.test(url)) return res.status(400).json({ message: "Portfolio link must start with http:// or https://" });
