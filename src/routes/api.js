@@ -1,10 +1,10 @@
 import { Router } from "express";
-import { Sale, Expense, Budget, Settings, Work, Payable, Profile, CATEGORIES, PAYEE_TYPES } from "../models/index.js";
+import { Sale, Expense, Budget, Settings, Payable, Profile, CATEGORIES, PAYEE_TYPES } from "../models/index.js";
 import { asyncRoute, clean, toDate, escapeRegex } from "../lib/util.js";
 import { money2, settle, balanceOf } from "../lib/payments.js";
 import { notifyCustomer, notifyPayee } from "../lib/notify.js";
 
-export const API_VERSION = "4.1.0"; // frontend checks this to detect an outdated deployment
+export const API_VERSION = "4.2.0"; // frontend checks this to detect an outdated deployment
 const router = Router();
 const STATUSES = ["Paid", "Partial", "Pending", "Overdue", "Cancelled"];
 const METHODS = ["Cash", "Bank Transfer", "Card", "Online", "Cheque", "Not recorded"];
@@ -230,6 +230,14 @@ router.patch("/profiles/:id", asyncRoute(async (req, res) => {
   res.json(p.toJSON());
 }));
 // Deleting a profile never deletes money records: its expenses and bills move to "Other".
+// A built-in profile (Rent, Labour...) is "deleted" by hiding it: its records move to Other and the card disappears. "Other" stays.
+router.delete("/profiles/builtin/:name", asyncRoute(async (req, res) => {
+  const name = CATEGORIES.find(c => c === req.params.name);
+  if (!name) return res.status(404).json({ message: "Profile not found." });
+  if (name === "Other") return res.status(400).json({ message: "The “Other” profile cannot be deleted." });
+  await Promise.all([Expense.updateMany({ category: name }, { $set: { category: "Other" } }), Payable.updateMany({ category: name }, { $set: { category: "Other" } }), Settings.findOneAndUpdate({ key: "main" }, { $addToSet: { hiddenProfiles: name } }, { upsert: true })]);
+  res.json({ deleted: name, movedTo: "Other" });
+}));
 router.delete("/profiles/:id", asyncRoute(async (req, res) => {
   if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Profile not found." });
   const p = await Profile.findByIdAndDelete(req.params.id);
@@ -396,84 +404,17 @@ router.delete("/payables/:id", asyncRoute(async (req, res) => {
   res.json({ deleted: req.params.id });
 }));
 
-// ---------- Construction work (area x rate) and working permissions ----------
-function buildWork(input, { partial = false } = {}) {
-  const doc = {};
-  const has = k => input[k] !== undefined;
-  if (!partial || has("employee")) { doc.employee = clean(input.employee); if (!doc.employee) return { error: "Employee name is required." }; }
-  if (!partial || has("site")) { doc.site = clean(input.site); if (!doc.site) return { error: "Area / site is required." }; }
-  if (!partial || has("areaSqft")) { doc.areaSqft = Number(input.areaSqft); if (!Number.isFinite(doc.areaSqft) || doc.areaSqft <= 0) return { error: "Area (sq ft) must be greater than zero." }; }
-  if (!partial || has("ratePerSqft")) { doc.ratePerSqft = Number(input.ratePerSqft); if (!Number.isFinite(doc.ratePerSqft) || doc.ratePerSqft <= 0) return { error: "Rate per sq ft must be greater than zero." }; }
-  if (has("employeePhone")) doc.employeePhone = clean(input.employeePhone);
-  if (has("status")) { if (!["Active", "Completed", "Cancelled"].includes(input.status)) return { error: "Status must be Active, Completed or Cancelled." }; doc.status = input.status; }
-  if (has("startedOn")) doc.startedOn = toDate(input.startedOn) || null;
-  if (has("permitNo")) doc.permitNo = clean(input.permitNo);
-  if (has("permitAuthority")) doc.permitAuthority = clean(input.permitAuthority);
-  if (has("permitStart")) doc.permitStart = toDate(input.permitStart) || null;
-  if (has("permitDue")) doc.permitDue = toDate(input.permitDue) || null;
-  if (has("notes")) doc.notes = clean(input.notes);
-  if (doc.permitStart && doc.permitDue && doc.permitDue < doc.permitStart) return { error: "Permission due date cannot be before its start date." };
-  return { doc };
-}
-
-router.get("/works", asyncRoute(async (req, res) => {
-  const q = {};
-  const text = clean(req.query.q).slice(0, 80);
-  if (text) { const rx = new RegExp(escapeRegex(text), "i"); q.$or = [{ employee: rx }, { site: rx }, { permitNo: rx }]; }
-  res.json((await Work.find(q).sort({ permitDue: 1, createdAt: -1 }).limit(2000)).map(w => w.toJSON()));
-}));
-router.post("/works", asyncRoute(async (req, res) => {
-  const { doc, error } = buildWork(req.body || {});
-  if (error) return res.status(400).json({ message: error });
-  doc.amount = money2(doc.areaSqft * doc.ratePerSqft);
-  res.status(201).json((await Work.create(doc)).toJSON());
-}));
-router.patch("/works/:id", asyncRoute(async (req, res) => {
-  if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Work not found." });
-  const { doc, error } = buildWork(req.body || {}, { partial: true });
-  if (error) return res.status(400).json({ message: error });
-  const work = await Work.findById(req.params.id);
-  if (!work) return res.status(404).json({ message: "Work not found." });
-  Object.assign(work, doc);
-  if (work.permitStart && work.permitDue && work.permitDue < work.permitStart) return res.status(400).json({ message: "Permission due date cannot be before its start date." });
-  work.amount = money2(work.areaSqft * work.ratePerSqft);
-  await work.save();
-  res.json(work.toJSON());
-}));
-// Renew the working permission: the old period is kept in permitHistory, the new dates become current.
-router.post("/works/:id/renew", asyncRoute(async (req, res) => {
-  if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Work not found." });
-  const start = toDate(req.body?.permitStart), due = toDate(req.body?.permitDue);
-  if (!due) return res.status(400).json({ message: "Enter the new permission due date." });
-  if (start && due < start) return res.status(400).json({ message: "Permission due date cannot be before its start date." });
-  const work = await Work.findById(req.params.id);
-  if (!work) return res.status(404).json({ message: "Work not found." });
-  if (work.permitDue || work.permitStart || work.permitNo) work.permitHistory.push({ permitNo: work.permitNo, permitStart: work.permitStart, permitDue: work.permitDue, note: clean(req.body?.note) });
-  work.permitStart = start || new Date();
-  work.permitDue = due;
-  if (req.body?.permitNo !== undefined) work.permitNo = clean(req.body.permitNo);
-  if (req.body?.permitAuthority !== undefined) work.permitAuthority = clean(req.body.permitAuthority);
-  await work.save();
-  res.json(work.toJSON());
-}));
-router.delete("/works/:id", asyncRoute(async (req, res) => {
-  if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Work not found." });
-  const w = await Work.findByIdAndDelete(req.params.id);
-  if (!w) return res.status(404).json({ message: "Work not found." });
-  res.json({ deleted: req.params.id });
-}));
-
 // ---------- Business settings (stored in the database) ----------
 router.get("/settings", asyncRoute(async (_req, res) => {
   const s = await Settings.findOneAndUpdate({ key: "main" }, { $setOnInsert: { key: "main" } }, { upsert: true, new: true });
-  res.json({ businessName: s.businessName, portfolio: s.portfolio });
+  res.json({ businessName: s.businessName, portfolio: s.portfolio, hiddenProfiles: s.hiddenProfiles || [] });
 }));
 router.put("/settings", asyncRoute(async (req, res) => {
   const set = {};
   if (req.body?.businessName !== undefined) { set.businessName = clean(req.body.businessName); if (!set.businessName) return res.status(400).json({ message: "Business name cannot be empty." }); }
   // The developer portfolio link is fixed in the app; it can no longer be changed through the API.
   const s = await Settings.findOneAndUpdate({ key: "main" }, { $setOnInsert: { key: "main" } }, { upsert: true, new: true });
-  res.json({ businessName: s.businessName, portfolio: s.portfolio });
+  res.json({ businessName: s.businessName, portfolio: s.portfolio, hiddenProfiles: s.hiddenProfiles || [] });
 }));
 router.put("/settings", asyncRoute(async (req, res) => {
   const set = {};
@@ -484,7 +425,7 @@ router.put("/settings", asyncRoute(async (req, res) => {
     set.portfolio = url;
   }
   const s = await Settings.findOneAndUpdate({ key: "main" }, { $set: set }, { upsert: true, new: true, runValidators: true });
-  res.json({ businessName: s.businessName, portfolio: s.portfolio });
+  res.json({ businessName: s.businessName, portfolio: s.portfolio, hiddenProfiles: s.hiddenProfiles || [] });
 }));
 
 export default router;
