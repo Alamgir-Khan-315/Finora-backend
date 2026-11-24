@@ -1,10 +1,10 @@
 import { Router } from "express";
-import { Sale, Expense, Budget, Settings, Payable, Category, CATEGORIES, PAYEE_TYPES } from "../models/index.js";
+import { Sale, Expense, Budget, Settings, Work, Payable, CATEGORIES, PAYEE_TYPES } from "../models/index.js";
 import { asyncRoute, clean, toDate, escapeRegex } from "../lib/util.js";
 import { money2, settle, balanceOf } from "../lib/payments.js";
 import { notifyCustomer, notifyPayee } from "../lib/notify.js";
 
-export const API_VERSION = "4.2.0"; // frontend checks this to detect an outdated deployment
+export const API_VERSION = "4.0.0"; // frontend checks this to detect an outdated deployment
 const router = Router();
 const STATUSES = ["Paid", "Partial", "Pending", "Overdue", "Cancelled"];
 const METHODS = ["Cash", "Bank Transfer", "Card", "Online", "Cheque", "Not recorded"];
@@ -201,58 +201,6 @@ router.delete("/sales/:id", asyncRoute(async (req, res) => {
   res.json({ deleted: req.params.id });
 }));
 
-
-// ---------- Categories (= expense profiles). Built-in ones + any the user creates ----------
-const MAX_CATEGORY = 40;
-// Returns the stored spelling of a category, creating it if it is new. Returns "" for an empty name.
-async function canonCategory(name) {
-  const v = clean(name).replace(/\s+/g, " ").slice(0, MAX_CATEGORY);
-  if (!v) return "";
-  const builtIn = CATEGORIES.find(c => c.toLowerCase() === v.toLowerCase());
-  const key = v.toLowerCase();
-  if (builtIn) { await Category.updateOne({ key, hidden: true }, { $set: { hidden: false } }); return builtIn; }   // using a deleted built-in again brings it back
-  const found = await Category.findOne({ key }).lean();
-  if (found) { if (found.hidden) await Category.updateOne({ key }, { $set: { hidden: false } }); return found.name; }
-  try { await Category.create({ name: v, key }); } catch (e) { if (e.code !== 11000) throw e; }
-  return (await Category.findOne({ key }).lean())?.name || v;
-}
-// Same, but for request bodies: replaces input.category by its canonical name.
-async function withCategory(input) {
-  if (input && input.category !== undefined) input.category = (await canonCategory(input.category)) || "Other";
-  return input;
-}
-
-router.get("/categories", asyncRoute(async (_req, res) => {
-  const docs = await Category.find().sort({ createdAt: 1 }).lean();
-  const hidden = new Set(docs.filter(c => c.hidden).map(c => c.key));
-  const stored = docs.filter(c => !c.hidden).map(c => c.name);
-  const used = [...(await Expense.distinct("category")), ...(await Payable.distinct("category")), ...(await Budget.distinct("category"))];
-  const out = [];
-  [...CATEGORIES, ...stored, ...used].filter(n => !hidden.has(clean(n).toLowerCase()) || used.includes(n)).forEach(n => { const v = clean(n); if (v && !out.some(o => o.toLowerCase() === v.toLowerCase())) out.push(v); });
-  res.json(out);
-}));
-// Delete a profile. Its expenses and bills are moved to "Other" (nothing is lost) and its monthly limit is removed.
-// "Other" itself cannot be deleted. Built-in profiles are hidden instead of removed, and come back if used again.
-router.delete("/categories/:name", asyncRoute(async (req, res) => {
-  const v = clean(req.params.name).replace(/\s+/g, " ").slice(0, MAX_CATEGORY);
-  const key = v.toLowerCase();
-  if (!key) return res.status(400).json({ message: "Profile name is missing." });
-  if (key === "other") return res.status(400).json({ message: "The “Other” profile cannot be deleted. It holds entries from deleted profiles." });
-  const rx = new RegExp(`^${escapeRegex(v)}$`, "i");
-  const moved = await Expense.updateMany({ category: rx }, { $set: { category: "Other" } });
-  const bills = await Payable.updateMany({ category: rx }, { $set: { category: "Other" } });
-  await Budget.deleteMany({ category: rx });
-  if (CATEGORIES.some(c => c.toLowerCase() === key)) await Category.updateOne({ key }, { $set: { name: v, key, hidden: true } }, { upsert: true });
-  else await Category.deleteOne({ key });
-  res.json({ deleted: v, movedExpenses: moved.modifiedCount, movedBills: bills.modifiedCount });
-}));
-router.post("/categories", asyncRoute(async (req, res) => {
-  const raw = clean(req.body?.name);
-  if (!raw) return res.status(400).json({ message: "Enter a profile name." });
-  if (raw.length > MAX_CATEGORY) return res.status(400).json({ message: `Profile name can be at most ${MAX_CATEGORY} characters.` });
-  res.status(201).json({ name: await canonCategory(raw) });
-}));
-
 // ---------- Expenses & monthly budgets ----------
 function buildExpense(input, { partial = false } = {}) {
   const doc = {};
@@ -261,7 +209,7 @@ function buildExpense(input, { partial = false } = {}) {
   if (has("payee")) doc.payee = clean(input.payee);
   if (has("payeeType")) { if (!PAYEE_TYPES.includes(input.payeeType)) return { error: "Unknown person type." }; doc.payeeType = input.payeeType; }
   if (!partial || has("amount")) { doc.amount = Number(input.amount); if (!Number.isFinite(doc.amount) || doc.amount <= 0) return { error: "Amount must be greater than zero." }; }
-  if (has("category")) doc.category = clean(input.category) || "Other";
+  if (has("category")) { if (!CATEGORIES.includes(input.category)) return { error: "Unknown category." }; doc.category = input.category; }
   if (has("date")) doc.date = toDate(input.date) || new Date();
   if (has("method")) doc.method = clean(input.method) || "Cash";
   if (has("notes")) doc.notes = clean(input.notes);
@@ -279,7 +227,7 @@ router.get("/expenses", asyncRoute(async (req, res) => {
   res.json((await Expense.find(q).sort({ date: -1 }).limit(2000)).map(d => d.toJSON()));
 }));
 router.post("/expenses", asyncRoute(async (req, res) => {
-  const { doc, error } = buildExpense(await withCategory(req.body || {}));
+  const { doc, error } = buildExpense(req.body || {});
   if (error) return res.status(400).json({ message: error });
   res.status(201).json((await Expense.create(doc)).toJSON());
 }));
@@ -292,11 +240,10 @@ router.delete("/expenses/:id", asyncRoute(async (req, res) => {
 
 router.get("/budgets", asyncRoute(async (_req, res) => res.json((await Budget.find().sort({ category: 1 })).map(b => b.toJSON()))));
 router.put("/budgets/:category", asyncRoute(async (req, res) => {
-  const category = await canonCategory(req.params.category);
-  if (!category) return res.status(400).json({ message: "Unknown category." });
+  if (!CATEGORIES.includes(req.params.category)) return res.status(400).json({ message: "Unknown category." });
   const limit = Number(req.body?.limit);
   if (!Number.isFinite(limit) || limit < 0) return res.status(400).json({ message: "Limit must be zero or more." });
-  const b = await Budget.findOneAndUpdate({ category }, { $set: { limit } }, { upsert: true, new: true, runValidators: true });
+  const b = await Budget.findOneAndUpdate({ category: req.params.category }, { $set: { limit } }, { upsert: true, new: true, runValidators: true });
   res.json(b.toJSON());
 }));
 
@@ -314,7 +261,7 @@ function buildBill(input, { partial = false } = {}) {
     if (doc.payeePhone && (!/^[+\d][\d\s\-()]*$/.test(doc.payeePhone) || digits.length < 7 || digits.length > 15)) return { error: "WhatsApp number must be 7 to 15 digits, e.g. 0300 1234567." };
   }
   if (has("payeeType")) { if (!PAYEE_TYPES.includes(input.payeeType)) return { error: "Unknown person type." }; doc.payeeType = input.payeeType; }
-  if (has("category")) doc.category = clean(input.category) || "Other";
+  if (has("category")) { if (!CATEGORIES.includes(input.category)) return { error: "Unknown category." }; doc.category = input.category; }
   if (has("date")) doc.date = toDate(input.date) || new Date();
   if (has("dueDate")) doc.dueDate = toDate(input.dueDate) || null;
   if (has("method")) doc.method = clean(input.method) || "Not recorded";
@@ -331,7 +278,7 @@ router.get("/payables", asyncRoute(async (req, res) => {
 }));
 
 router.post("/payables", asyncRoute(async (req, res) => {
-  const { doc, error } = buildBill(await withCategory(req.body || {}));
+  const { doc, error } = buildBill(req.body || {});
   if (error) return res.status(400).json({ message: error });
   let paid = Number(req.body?.paidNow ?? 0);
   if (!Number.isFinite(paid) || paid < 0) return res.status(400).json({ message: "Amount paid must be zero or more." });
@@ -347,7 +294,7 @@ router.post("/payables", asyncRoute(async (req, res) => {
 // Update a bill. Asking for "Paid" records the remaining balance as a payment. Returns `notification` when the person should hear about it.
 router.patch("/payables/:id", asyncRoute(async (req, res) => {
   if (!isId(req.params.id)) return res.status(404).json({ message: "Bill not found." });
-  const { doc, error } = buildBill(await withCategory(req.body || {}), { partial: true });
+  const { doc, error } = buildBill(req.body || {}, { partial: true });
   if (error) return res.status(400).json({ message: error });
   const bill = await Payable.findById(req.params.id);
   if (!bill) return res.status(404).json({ message: "Bill not found." });
@@ -412,19 +359,88 @@ router.delete("/payables/:id", asyncRoute(async (req, res) => {
   res.json({ deleted: req.params.id });
 }));
 
+// ---------- Construction work (area x rate) and working permissions ----------
+function buildWork(input, { partial = false } = {}) {
+  const doc = {};
+  const has = k => input[k] !== undefined;
+  if (!partial || has("employee")) { doc.employee = clean(input.employee); if (!doc.employee) return { error: "Employee name is required." }; }
+  if (!partial || has("site")) { doc.site = clean(input.site); if (!doc.site) return { error: "Area / site is required." }; }
+  if (!partial || has("areaSqft")) { doc.areaSqft = Number(input.areaSqft); if (!Number.isFinite(doc.areaSqft) || doc.areaSqft <= 0) return { error: "Area (sq ft) must be greater than zero." }; }
+  if (!partial || has("ratePerSqft")) { doc.ratePerSqft = Number(input.ratePerSqft); if (!Number.isFinite(doc.ratePerSqft) || doc.ratePerSqft <= 0) return { error: "Rate per sq ft must be greater than zero." }; }
+  if (has("employeePhone")) doc.employeePhone = clean(input.employeePhone);
+  if (has("status")) { if (!["Active", "Completed", "Cancelled"].includes(input.status)) return { error: "Status must be Active, Completed or Cancelled." }; doc.status = input.status; }
+  if (has("startedOn")) doc.startedOn = toDate(input.startedOn) || null;
+  if (has("permitNo")) doc.permitNo = clean(input.permitNo);
+  if (has("permitAuthority")) doc.permitAuthority = clean(input.permitAuthority);
+  if (has("permitStart")) doc.permitStart = toDate(input.permitStart) || null;
+  if (has("permitDue")) doc.permitDue = toDate(input.permitDue) || null;
+  if (has("notes")) doc.notes = clean(input.notes);
+  if (doc.permitStart && doc.permitDue && doc.permitDue < doc.permitStart) return { error: "Permission due date cannot be before its start date." };
+  return { doc };
+}
+
+router.get("/works", asyncRoute(async (req, res) => {
+  const q = {};
+  const text = clean(req.query.q).slice(0, 80);
+  if (text) { const rx = new RegExp(escapeRegex(text), "i"); q.$or = [{ employee: rx }, { site: rx }, { permitNo: rx }]; }
+  res.json((await Work.find(q).sort({ permitDue: 1, createdAt: -1 }).limit(2000)).map(w => w.toJSON()));
+}));
+router.post("/works", asyncRoute(async (req, res) => {
+  const { doc, error } = buildWork(req.body || {});
+  if (error) return res.status(400).json({ message: error });
+  doc.amount = money2(doc.areaSqft * doc.ratePerSqft);
+  res.status(201).json((await Work.create(doc)).toJSON());
+}));
+router.patch("/works/:id", asyncRoute(async (req, res) => {
+  if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Work not found." });
+  const { doc, error } = buildWork(req.body || {}, { partial: true });
+  if (error) return res.status(400).json({ message: error });
+  const work = await Work.findById(req.params.id);
+  if (!work) return res.status(404).json({ message: "Work not found." });
+  Object.assign(work, doc);
+  if (work.permitStart && work.permitDue && work.permitDue < work.permitStart) return res.status(400).json({ message: "Permission due date cannot be before its start date." });
+  work.amount = money2(work.areaSqft * work.ratePerSqft);
+  await work.save();
+  res.json(work.toJSON());
+}));
+// Renew the working permission: the old period is kept in permitHistory, the new dates become current.
+router.post("/works/:id/renew", asyncRoute(async (req, res) => {
+  if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Work not found." });
+  const start = toDate(req.body?.permitStart), due = toDate(req.body?.permitDue);
+  if (!due) return res.status(400).json({ message: "Enter the new permission due date." });
+  if (start && due < start) return res.status(400).json({ message: "Permission due date cannot be before its start date." });
+  const work = await Work.findById(req.params.id);
+  if (!work) return res.status(404).json({ message: "Work not found." });
+  if (work.permitDue || work.permitStart || work.permitNo) work.permitHistory.push({ permitNo: work.permitNo, permitStart: work.permitStart, permitDue: work.permitDue, note: clean(req.body?.note) });
+  work.permitStart = start || new Date();
+  work.permitDue = due;
+  if (req.body?.permitNo !== undefined) work.permitNo = clean(req.body.permitNo);
+  if (req.body?.permitAuthority !== undefined) work.permitAuthority = clean(req.body.permitAuthority);
+  await work.save();
+  res.json(work.toJSON());
+}));
+router.delete("/works/:id", asyncRoute(async (req, res) => {
+  if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Work not found." });
+  const w = await Work.findByIdAndDelete(req.params.id);
+  if (!w) return res.status(404).json({ message: "Work not found." });
+  res.json({ deleted: req.params.id });
+}));
+
 // ---------- Business settings (stored in the database) ----------
-// The portfolio link is fixed, so nobody can point "Visit profile" at another site.
-const PORTFOLIO_URL = "https://portfolio-web-psi-rosy.vercel.app/";
 router.get("/settings", asyncRoute(async (_req, res) => {
   const s = await Settings.findOneAndUpdate({ key: "main" }, { $setOnInsert: { key: "main" } }, { upsert: true, new: true });
-  res.json({ businessName: s.businessName, portfolio: PORTFOLIO_URL });
+  res.json({ businessName: s.businessName, portfolio: s.portfolio });
 }));
 router.put("/settings", asyncRoute(async (req, res) => {
   const set = {};
   if (req.body?.businessName !== undefined) { set.businessName = clean(req.body.businessName); if (!set.businessName) return res.status(400).json({ message: "Business name cannot be empty." }); }
-  // A "portfolio" value sent by a client is ignored on purpose: the link is locked.
+  if (req.body?.portfolio !== undefined) {
+    const url = clean(req.body.portfolio);
+    if (url && !/^https?:\/\//i.test(url)) return res.status(400).json({ message: "Portfolio link must start with http:// or https://" });
+    set.portfolio = url;
+  }
   const s = await Settings.findOneAndUpdate({ key: "main" }, { $set: set }, { upsert: true, new: true, runValidators: true });
-  res.json({ businessName: s.businessName, portfolio: PORTFOLIO_URL });
+  res.json({ businessName: s.businessName, portfolio: s.portfolio });
 }));
 
 export default router;
